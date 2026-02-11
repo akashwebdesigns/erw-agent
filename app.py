@@ -1,12 +1,61 @@
 from incident_parser import parse_short_description
-
+from similarity import rank_by_similarity
 from servicenow import get_incident, search_incidents_by_erw
 from fastapi import FastAPI, HTTPException
 
 
 
 
+# app = FastAPI(title="ERW Auto-Triage Agent")
+
+# @app.post("/triage")
+# def triage(payload: dict):
+#     sys_id = payload.get("sys_id")
+#     number = payload.get("number")
+
+#     if not sys_id:
+#         raise HTTPException(status_code=400, detail="sys_id missing")
+
+#     # Fetch current incident
+#     incident = get_incident(sys_id)
+
+#     short_desc = incident.get("short_description")
+#     description = incident.get("description")
+#     temp_wa = incident.get("u_temporary_workaround")
+#     state = incident.get("state")
+
+#     # Parse structured fields
+#     parsed = parse_short_description(short_desc)
+#     erw_code = parsed.get("erw_code")
+
+#     # Search historical incidents using ERW anchor
+#     historical = []
+#     if erw_code:
+#         historical = search_incidents_by_erw(erw_code, sys_id)
+
+#     print("\n========== INCIDENT RECEIVED ==========")
+#     print("Incident Number :", number)
+#     print("Short Description :", short_desc)
+#     print("Description :", description)
+#     print("Temporary Workaround :", temp_wa)
+#     print("State :", state)
+#     print("Parsed Fields :", parsed)
+#     print("Found Historical Incidents :", len(historical))
+
+#     for h in historical:
+#         print(" -", h["number"], "|", h["short_description"])
+
+#     print("=======================================\n")
+
+#     return {
+#         "status": "success",
+#         "incident_number": number,
+#         "parsed": parsed,
+#         "historical_count": len(historical)
+#     }
+
 app = FastAPI(title="ERW Auto-Triage Agent")
+
 
 @app.post("/triage")
 def triage(payload: dict):
@@ -33,6 +82,11 @@ def triage(payload: dict):
     if erw_code:
         historical = search_incidents_by_erw(erw_code, sys_id)
 
+    # Rank by semantic similarity
+    ranked = []
+    if historical:
+        ranked = rank_by_similarity(short_desc, historical)
+
     print("\n========== INCIDENT RECEIVED ==========")
     print("Incident Number :", number)
     print("Short Description :", short_desc)
@@ -42,8 +96,16 @@ def triage(payload: dict):
     print("Parsed Fields :", parsed)
     print("Found Historical Incidents :", len(historical))
 
-    for h in historical:
-        print(" -", h["number"], "|", h["short_description"])
+    if ranked:
+        print("\nSimilarity Ranking:")
+        for r in ranked:
+            print(
+                f" - {r['incident']['number']} | "
+                f"Score: {round(r['score'], 4)} | "
+                f"{r['incident']['short_description']}"
+            )
+    else:
+        print("No historical incidents to rank.")
 
     print("=======================================\n")
 
@@ -51,6 +113,8 @@ def triage(payload: dict):
         "status": "success",
         "incident_number": number,
         "parsed": parsed,
-        "historical_count": len(historical)
+        "historical_count": len(historical),
+        "top_match": ranked[0]["incident"]["number"] if ranked else None
     }
+
 
