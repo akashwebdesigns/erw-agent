@@ -85,7 +85,7 @@ def triage(payload: dict):
     # Rank by semantic similarity
     ranked = []
     if historical:
-        ranked = rank_by_similarity(short_desc, historical)
+        ranked = rank_by_similarity(short_desc, historical, parsed)
 
     print("\n========== INCIDENT RECEIVED ==========")
     print("Incident Number :", number)
