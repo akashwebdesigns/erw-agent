@@ -51,3 +51,35 @@ def search_incidents_by_erw(erw_code: str, exclude_sys_id: str, limit: int = 20)
     response.raise_for_status()
     return response.json()["result"]
 
+    
+def create_incident(short_description: str, description: str):
+
+    url = f"{SERVICENOW_INSTANCE}/api/now/table/{INCIDENT_TABLE}"
+
+    payload = {
+        "short_description": short_description,
+        "description": description,
+        "caller_id": "a8f98bb0eb32010045e1a5115206fe3a"
+    }
+
+    print("CREATE INCIDENT PAYLOAD:", payload)
+
+    response = requests.post(
+        url,
+        auth=(SERVICENOW_USERNAME, SERVICENOW_PASSWORD),
+        headers=HEADERS,
+        json=payload,
+        timeout=90
+    )
+
+    # response.raise_for_status()
+    if not response.ok:
+        print("SERVICE NOW ERROR:")
+        print(response.status_code)
+        print(response.text)
+        response.raise_for_status()
+
+    return response.json()["result"]
+
+
+
