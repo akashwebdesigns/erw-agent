@@ -4,14 +4,38 @@ from servicenow import get_incident, search_incidents_by_erw, create_incident
 from fastapi import FastAPI, HTTPException
 from ai_workaround_judge import evaluate_workaround
 from ai_intent_extractor import extract_incident_fields
-
-
-
-
+from ai_workaround_validator import validate_workaround
+from rule_intent_extractor import extract_rule_fields
+import numpy as np
+import requests
+import os
+from dotenv import load_dotenv
 
 app = FastAPI(title="ERW Auto-Triage Agent")
+from rag_builder import embed_text
 
 from fastapi.middleware.cors import CORSMiddleware
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found.")
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY
+)
+
+
+
+from rag_loader import load_rag
+from rag_query import search
+from rag_answer import generate_answer
+
+index, metadata = load_rag()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,208 +47,284 @@ app.add_middleware(
 
 
 
-# @app.post("/triage")
-# def triage(payload: dict):
-#     try:
-#         sys_id = payload.get("sys_id")
-#         number = payload.get("number")
-
-#         if not sys_id:
-#             raise HTTPException(status_code=400, detail="sys_id missing")
-
-#         # Fetch current incident
-#         incident = get_incident(sys_id)
-
-#         short_desc = incident.get("short_description")
-#         description = incident.get("description")
-#         temp_wa = incident.get("u_temporary_workaround")
-#         state = incident.get("state")
-
-#         # Parse structured fields
-#         parsed = parse_short_description(short_desc)
-#         erw_code = parsed.get("erw_code")
-
-#         # Search historical incidents using ERW anchor
-#         historical = []
-#         if erw_code:
-#             historical = search_incidents_by_erw(erw_code, sys_id)
-        
-#         print("DEBUG 1 - After fetching incident")
-
-#         # Rank by semantic similarity (safe for None)
-#         ranked = []
-#         if historical:
-#             print("DEBUG 1 - After fetching incident")
-#             ranked = rank_by_similarity(short_desc or "", historical, parsed)
-
-#         print("\n========== INCIDENT RECEIVED ==========")
-#         print("Incident Number :", number)
-#         print("Short Description :", short_desc)
-#         print("Description :", description)
-#         print("Temporary Workaround :", temp_wa)
-#         print("State :", state)
-#         print("Parsed Fields :", parsed)
-#         print("Found Historical Incidents :", len(historical))
-
-#         if ranked:
-#             print("\nSimilarity Ranking:")
-#             for r in ranked:
-#                 print(
-#                     f" - {r['incident']['number']} | "
-#                     f"Semantic: {r['semantic_score']} | "
-#                     f"Final: {r['final_score']} | "
-#                     f"{r['incident']['short_description']}"
-#                 )
-#         else:
-#             print("No historical incidents to rank.")
-
-#         print("=======================================\n")
-
-#         return {
-#             "status": "success",
-#             "incident_number": number,
-#             "parsed": parsed,
-#             "historical_count": len(historical),
-#             "top_match": ranked[0]["incident"]["number"] if ranked else None
-#         }
-
-#     except Exception as e:
-#         print("FULL ERROR TRACE:")
-#         traceback.print_exc()
-#         return {"error": str(e)}
-
-
-# @app.post("/chat-create-incident")
-# def chat_create_incident(data: dict):
-#     state = data.get("state")
-#     line = data.get("line")
-#     company = data.get("company")
-#     txn_type = data.get("txn_type")
-#     erw_code = data.get("erw_code")
-#     description = data.get("description")
-
-#     short_description = f"{state} {line} {company} "
-#     if txn_type:
-#         short_description += f"{txn_type} "
-#     short_description += f"{erw_code} {description}"
-
-#     # Create incident
-#     created = create_incident(short_description, description)
-
-#     sys_id = created["sys_id"]
-
-#     # Run triage internally
-#     incident = get_incident(sys_id)
-#     parsed = parse_short_description(short_description)
-#     historical = search_incidents_by_erw(parsed["erw_code"], sys_id)
-#     ranked = rank_by_similarity(short_description, historical, parsed)
-
-#     return {
-#         "created_incident": created["number"],
-#         "suggestions": [
-#             {
-#                 "incident_number": r["incident"]["number"],
-#                 "confidence": r["final_score"],
-#                 "workaround": r["incident"].get("u_temporary_workaround")
-#             }
-#             for r in ranked[:3]
-#         ]
-#     }
-
+REQUIRED_FIELDS = ["state", "line", "company", "erw_code", "description"]
 
 
 @app.post("/chat-create-incident")
 def chat_create_incident(data: dict):
 
-    state = data.get("state")
-    line = data.get("line")
-    company = data.get("company")
-    txn_type = data.get("txn_type")
-    erw_code = data.get("erw_code")
-    description = data.get("description")
+    user_query = data.get("query")
+    collected_data = data.get("collected_data", {})
 
-    # ===============================
-    # BUILD SHORT DESCRIPTION
-    # ===============================
+    # ==============================
+    # STEP 1 — Extract using AI
+    # ==============================
+    extracted = extract_incident_fields(user_query)
+
+    if extracted is None:
+        extracted = {}
+
+    # Merge previous + new
+    extracted = {**collected_data, **extracted}
+
+    # ======================================================
+    # FIX #2 — PREVENT HALLUCINATED GENERIC DESCRIPTIONS
+    # ======================================================
+    if extracted.get("description"):
+        desc = extracted["description"].strip().lower()
+
+        generic_phrases = [
+            "new incident",
+            "incident",
+            "create incident",
+            "incident creation",
+            "log incident"
+        ]
+
+        if desc in generic_phrases:
+            extracted["description"] = None
+
+    print("CURRENT EXTRACTED DATA:", extracted)
+
+    # ==============================
+    # STEP 2 — Check Missing Fields
+    # ==============================
+    missing = [
+        field for field in REQUIRED_FIELDS
+        if not extracted.get(field)
+    ]
+
+    if missing:
+        return {
+            "status": "incomplete",
+            "missing_fields": missing,
+            "collected_data": extracted
+        }
+
+    # ==============================
+    # STEP 3 — Create Incident
+    # ==============================
+    state = extracted["state"]
+    line = extracted["line"]
+    company = extracted["company"]
+    txn_type = extracted.get("txn_type")
+    erw_code = extracted["erw_code"]
+    description = extracted["description"]
+
     short_description = f"{state} {line} {company} "
     if txn_type:
         short_description += f"{txn_type} "
     short_description += f"{erw_code} {description}"
 
-    # ===============================
-    # CREATE INCIDENT
-    # ===============================
     created = create_incident(short_description, description)
     sys_id = created["sys_id"]
 
-    # ===============================
-    # RUN TRIAGE
-    # ===============================
-    incident = get_incident(sys_id)
-
+    # ==============================
+    # STEP 4 — Similarity Retrieval
+    # ==============================
     parsed = parse_short_description(short_description)
+    historical = search_incidents_by_erw(parsed["erw_code"], sys_id)
 
-    historical = search_incidents_by_erw(
-        parsed["erw_code"],
-        sys_id
-    )
+    ranked = rank_by_similarity(short_description, historical, parsed)
 
-    ranked = rank_by_similarity(
-        short_description,
-        historical,
-        parsed
-    )
-
-    # ===============================
-    # AI WORKAROUND EVALUATION
-    # ===============================
-    final_suggestions = []
+    # ==============================
+    # STEP 5 — AI VALIDATION + CONFIDENCE FUSION
+    # ==============================
+    validated_results = []
 
     for r in ranked:
 
-        inc = r["incident"]
+        incident_hist = r["incident"]
 
-        temp_wa = inc.get("u_temporary_workaround", "")
-        work_notes = inc.get("close_notes", "")
-        inc_state = inc.get("state", "")
+        workaround = incident_hist.get("u_temporary_workaround")
+        close_notes = incident_hist.get("close_notes") or ""
 
-        # Skip empty workaround directly
-        if not temp_wa:
+        # ❌ Skip if no workaround present
+        if not workaround:
             continue
 
-        try:
-            ai_result = evaluate_workaround(
-                temp_wa,
-                work_notes,
-                inc_state
-            )
+        # 🤖 Ask Gemini if workaround worked
+        ai_result = validate_workaround(
+            incident_hist.get("short_description"),
+            workaround,
+            close_notes
+        )
 
-            print("AI RESULT:", ai_result)
+        if ai_result.get("result") != "SUCCESS":
+            continue
 
-            # VERY SIMPLE FILTER FOR NOW
-            if "SUCCESS" in ai_result.upper():
+        ai_confidence = ai_result.get("confidence", 0.0)
 
-                final_suggestions.append({
-                    "incident_number": inc["number"],
-                    "confidence": r["final_score"],
-                    "workaround": temp_wa
-                })
+        # 🧠 AI Confidence Fusion
+        final_confidence = (
+            0.5 * r["semantic_score"] +
+            0.3 * ai_confidence +
+            0.2 * r["structured_boost"]
+        )
 
-        except Exception as e:
-            print("AI evaluation failed:", str(e))
+        # Apply threshold
+        if final_confidence < 0.6:
+            continue
 
-    # ===============================
-    # RETURN RESPONSE
-    # ===============================
+        validated_results.append({
+            "incident_number": incident_hist["number"],
+            "confidence": round(final_confidence, 2),
+            "workaround": workaround
+        })
+
+    # Sort by confidence
+    validated_results.sort(
+        key=lambda x: x["confidence"],
+        reverse=True
+    )
+
     return {
+        "status": "created",
         "created_incident": created["number"],
-        "suggestions": final_suggestions[:3]
+        "suggestions": validated_results[:3]
     }
 
 
-@app.post("/test-extract")
-def test_extract(data: dict):
-    return extract_incident_fields(data.get("query"))
 
+
+@app.post("/ask-rule")
+def ask_rule(data: dict):
+
+    try:
+        user_query = data.get("query")
+
+        if not user_query:
+            return {"error": "Query required."}
+
+        # =====================================
+        # STEP 1 — Extract structured fields
+        # =====================================
+        extracted = extract_rule_fields(user_query)
+
+        print("RULE EXTRACTED:", extracted)
+
+        if not isinstance(extracted, dict):
+            extracted = {}
+
+        state = extracted.get("state")
+        line = extracted.get("line")
+        company = extracted.get("company")
+        question = extracted.get("question")
+
+        # =====================================
+        # STEP 2 — Validate Required Fields
+        # =====================================
+        missing = []
+
+        if not state:
+            missing.append("state")
+        if not line:
+            missing.append("line")
+        if not company:
+            missing.append("company")
+
+        if missing:
+            return {
+                "status": "incomplete",
+                "missing_fields": missing,
+                "extracted": extracted
+            }
+
+        # =====================================
+        # STEP 3 — Build Semantic Search Query
+        # =====================================
+        search_query = f"{state} {line} {company} {question}"
+
+        embedding = embed_text(search_query)
+
+        if embedding is None or len(embedding) == 0:
+            return {"error": "Embedding generation failed."}
+
+        embedding_array = np.array(embedding).astype("float32").reshape(1, -1)
+
+        # =====================================
+        # STEP 4 — FAISS Search
+        # =====================================
+        D, I = index.search(embedding_array, 5)
+
+        retrieved_chunks = []
+
+        for idx in I[0]:
+            if 0 <= idx < len(metadata):
+                chunk_data = metadata[idx]
+
+                # If metadata is dict, extract text
+                if isinstance(chunk_data, dict):
+                    retrieved_chunks.append(chunk_data.get("text", ""))
+                else:
+                    retrieved_chunks.append(chunk_data)
+
+        # Remove empty chunks
+        retrieved_chunks = [c for c in retrieved_chunks if c]
+
+        if not retrieved_chunks:
+            return {
+                "status": "success",
+                "state": state,
+                "line": line,
+                "company": company,
+                "answer": "Not found in rules."
+            }
+
+        context = "\n\n".join(retrieved_chunks)
+
+        # =====================================
+        # STEP 5 — Ask Gemini With Context
+        # =====================================
+        final_prompt = f"""
+You are an insurance rule assistant.
+
+Answer strictly and ONLY based on the provided context.
+If the answer is not present in the context, reply exactly:
+"Not found in rules."
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": final_prompt}
+                    ]
+                }
+            ]
+        }
+
+        headers = {"Content-Type": "application/json"}
+
+        response = requests.post(
+            GEMINI_URL,
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+
+        response.raise_for_status()
+
+        raw_answer = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+        answer = raw_answer.strip()
+
+        return {
+            "status": "success",
+            "state": state,
+            "line": line,
+            "company": company,
+            "answer": answer
+        }
+
+    except Exception as e:
+        print("ASK RULE ERROR:", str(e))
+        return {"error": str(e)}
 
 
