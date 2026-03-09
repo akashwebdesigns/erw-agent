@@ -82,4 +82,29 @@ def create_incident(short_description: str, description: str):
     return response.json()["result"]
 
 
+def update_incident_with_workaround(sys_id: str, workaround_text: str, source_incident: str):
+    url = f"{SERVICENOW_INSTANCE}/api/now/table/{INCIDENT_TABLE}/{sys_id}"
+
+    worknote_text = (
+        f"Workaround has been auto-populated by ERW AI Agent based on historical resolution {source_incident}."
+    )
+
+    payload = {
+        "u_temporary_workaround": workaround_text,
+        "work_notes": worknote_text
+        
+    }
+
+    response = requests.patch(
+        url,
+        auth=(SERVICENOW_USERNAME, SERVICENOW_PASSWORD),
+        headers=HEADERS,
+        json=payload,
+        timeout=30
+    )
+
+    response.raise_for_status()
+    return response.json()["result"]
+
+
 

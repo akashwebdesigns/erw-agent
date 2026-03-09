@@ -10,6 +10,8 @@ import numpy as np
 import requests
 import os
 from dotenv import load_dotenv
+from servicenow import update_incident_with_workaround
+from ai_tool_router import detect_tool
 
 app = FastAPI(title="ERW Auto-Triage Agent")
 from rag_builder import embed_text
@@ -178,11 +180,62 @@ def chat_create_incident(data: dict):
         reverse=True
     )
 
+    # return {
+    #     "status": "created",
+    #     "created_incident": created["number"],
+    #     "suggestions": validated_results[:3]
+    # }
+
+    # # ============================================
+    # # STEP 6 — Auto Post Best Workaround
+    # # ============================================
+
+    # top_workaround_posted = False
+
+    # if validated_results:
+    #     best_wa = validated_results[0]["workaround"]
+
+    #     try:
+    #         update_incident_workaround(sys_id, best_wa)
+    #         top_workaround_posted = True
+    #         print("AUTO-POSTED WA TO INCIDENT:", sys_id)
+    #     except Exception as e:
+    #         print("FAILED TO POST WA:", str(e))
+
+    # return {
+    #     "status": "created",
+    #     "created_incident": created["number"],
+    #     "workaround_posted": top_workaround_posted,
+    #     "suggestions": validated_results[:3]
+    # }
+
+    # ============================================
+# STEP 6 — Auto Post Best Workaround + Worknote
+# ============================================
+
+    top_workaround_posted = False
+    posted_source_incident = None
+
+    if validated_results:
+        best_result = validated_results[0]
+        best_wa = best_result["workaround"]
+        source_incident = best_result["incident_number"]
+
+        try:
+            update_incident_with_workaround(sys_id, best_wa, source_incident)
+            top_workaround_posted = True
+            posted_source_incident = source_incident
+            print("AUTO-POSTED WA TO INCIDENT:", sys_id)
+        except Exception as e:
+            print("FAILED TO POST WA:", str(e))
+
     return {
-        "status": "created",
-        "created_incident": created["number"],
-        "suggestions": validated_results[:3]
-    }
+    "status": "created",
+    "created_incident": created["number"],
+    "workaround_posted": top_workaround_posted,
+    "posted_from_incident": posted_source_incident,
+    "suggestions": validated_results[:3]
+}
 
 
 
@@ -191,6 +244,7 @@ def chat_create_incident(data: dict):
 def ask_rule(data: dict):
 
     try:
+        print("Entered in the /ask-rule")
         user_query = data.get("query")
 
         if not user_query:
@@ -315,6 +369,8 @@ Question:
 
         answer = raw_answer.strip()
 
+        print(answer)
+
         return {
             "status": "success",
             "state": state,
@@ -326,5 +382,35 @@ Question:
     except Exception as e:
         print("ASK RULE ERROR:", str(e))
         return {"error": str(e)}
+
+
+@app.post("/chat")
+def chat_router(data: dict):
+
+    user_query = data.get("query")
+    collected_data = data.get("collected_data", {})
+
+    if not user_query:
+        return {"error": "Query required."}
+
+    # STEP 1 — Detect Tool
+    tool_data = detect_tool(user_query)
+    tool = tool_data.get("tool")
+
+    print("AI ROUTER DECISION:", tool)
+
+    # STEP 2 — Route to Tool
+    if tool == "ask_rule":
+
+        return ask_rule({
+            "query": user_query
+        })
+
+    else:
+
+        return chat_create_incident({
+            "query": user_query,
+            "collected_data": collected_data
+        })
 
 

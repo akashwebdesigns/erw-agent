@@ -1,0 +1,15 @@
+(function executeRule(current, previous) {
+
+    var payload = {
+        sys_id: current.sys_id.toString(),
+        number: current.number.toString()
+    };
+
+    var r = new sn_ws.RESTMessageV2();
+    r.setEndpoint("https://erw-agent.onrender.com/triage");
+    r.setHttpMethod("POST");
+    r.setRequestHeader("Content-Type", "application/json");
+    r.setRequestBody(JSON.stringify(payload));
+    r.execute();
+
+})(current, previous);
